@@ -12,6 +12,19 @@ import '../models/speed_zone.dart';
 import '../models/hazard.dart';
 import '../models/route_data.dart';
 import '../models/route_step.dart';
+import '../widgets/trip_info_panel.dart';
+import '../widgets/premium_search_bar.dart';
+
+// Debouncer helper
+class Debouncer {
+  final int milliseconds;
+  Timer? _timer;
+  Debouncer({required this.milliseconds});
+  run(VoidCallback action) {
+    if (_timer != null) _timer!.cancel();
+    _timer = Timer(Duration(milliseconds: milliseconds), action);
+  }
+}
 
 class NavigationScreen extends ConsumerStatefulWidget {
   const NavigationScreen({super.key});
@@ -32,11 +45,16 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
   
   // Search State
   final TextEditingController _searchController = TextEditingController();
+  final _debouncer = Debouncer(milliseconds: 500); // 500ms delay for search
   bool _isSearching = false;
   List<SearchResult> _searchResults = [];
   
   // Navigation State
-  RouteData? _currentRoute; 
+  List<RouteData> _availableRoutes = []; // Store all fetched routes
+  int _selectedRouteIndex = 0;
+  RouteData? get _currentRoute => _availableRoutes.isNotEmpty && _selectedRouteIndex < _availableRoutes.length 
+      ? _availableRoutes[_selectedRouteIndex] 
+      : null;
   bool _isNavigating = false;
   bool _isPreviewing = false; // New state for Route Preview
   bool _showDirections = false;
@@ -231,8 +249,17 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
   }
 
   Future<void> _performSearch(String query) async {
+    if (query.isEmpty) {
+        setState(() {
+            _searchResults = [];
+            _isSearching = false;
+        });
+        return;
+    }
+
     setState(() => _isSearching = true);
     try {
+      // Use standard search or maybe specific autocomplete if API supports
       final results = await ref.read(apiServiceProvider).searchPlaces(
         query, 
         lat: _currentPosition.latitude, 
@@ -268,33 +295,24 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
       
       if (routes.isEmpty) return;
 
-      // Smart Rerouting Logic:
-      // If primary route (index 0) has a hazard, pick alternate (index 1) if available
-      RouteData bestRoute = routes[0];
-      final hazards = ref.read(hazardsProvider);
+      // Logic: Just load all routes, default to first (best).
+      // Warn if selected has hazard.
       
-      bool primaryHasHazard = _routeIntersectsHazards(bestRoute.points, hazards);
-      print("Primary route has hazard: $primaryHasHazard");
-      
-      if (primaryHasHazard && routes.length > 1) {
-         bestRoute = routes[1]; // Pick alternate
-         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Hazard on route! Switching to alternate.")));
-      } else if (primaryHasHazard) {
-         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Caution: Hazard on route. No alternate available.")));
-      } else {
-         print("No hazards on primary route.");
-      }
-
       setState(() {
-        _currentRoute = bestRoute;
+        _availableRoutes = routes;
+        _selectedRouteIndex = 0; // Default to best
+        // _currentRoute getter will now return _availableRoutes[0]
         _isNavigating = false; // Wait for "Start Trip"
         _isPreviewing = true;  // Show Preview UI
         _showDirections = false;
       });
-      // Zoom out to show whole route? Or just user position?
-      // Let's center on user first
-      _mapController.move(_currentPosition, 16.0);
-      // _startSimulation(); // Disabled per user request (Arrow should move with user)
+      
+      // Animation: Fit bounds to show route
+      if (_currentRoute != null) {
+          final bounds = LatLngBounds.fromPoints(_currentRoute!.points);
+          // Add some padding
+          _mapController.fitCamera(CameraFit.bounds(bounds: bounds, padding: const EdgeInsets.all(50)));
+      }
       
     } catch (e) {
       print("Navigation error: $e");
@@ -583,6 +601,7 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
                     : 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                 userAgentPackageName: 'com.saferoute',
               ),
+              
               // Attribution for Satellite
               if (_isSatellite)
                 const RichAttributionWidget(
@@ -594,6 +613,17 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
                 ),
               PolylineLayer(
                 polylines: [
+                  // Render Alternate Routes (Grey)
+                  ..._availableRoutes.asMap().entries.where((e) => e.key != _selectedRouteIndex).map((e) {
+                     return Polyline(
+                       points: e.value.points,
+                       strokeWidth: 4.0,
+                       color: Colors.grey,
+                       // No onTap on Polyline directly, currently just visual
+                     );
+                  }),
+                  
+                  // Render Selected Route (Blue)
                   if (_currentRoute != null)
                     Polyline(
                       points: _currentRoute!.points,
@@ -693,85 +723,56 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
             ),
 
           // ... Search Box ...
-          if (!_isAuthority)
-          Positioned(
-            top: 50,
-            left: 16,
-            right: 16,
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Card(
-                  elevation: 4,
-                  child: Column(
-                    children: [
-                      Row(
-                        children: [
-                          Builder(builder: (context) => IconButton(
-                            icon: const Icon(Icons.menu),
-                            onPressed: () => Scaffold.of(context).openDrawer(),
-                          )),
-                          Expanded(
-                            child: Padding(
-                              padding: const EdgeInsets.only(right: 16.0),
-                              child: TextField(
-                                controller: _searchController,
-                                decoration: const InputDecoration(
-                                  hintText: "Search Place...",
-                                  border: InputBorder.none,
-                                ),
-                                onSubmitted: _performSearch,
-                              ),
-                            ),
-                          ),
-                          IconButton(
-                            icon: _isSearching 
-                              ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
-                              : const Icon(Icons.search), 
-                            onPressed: () {
-                               if (_searchController.text.isNotEmpty) {
-                                  _performSearch(_searchController.text);
-                                  FocusScope.of(context).unfocus();
-                               }
-                            }
-                          ),
-                        ],
-                      ),
-                      // Vehicle Type Selector
-                      if (!_isNavigating)
-                      Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                          children: [
-                            _buildVehicleButton(context, ref, 'car', Icons.directions_car),
-                            _buildVehicleButton(context, ref, 'bike', Icons.directions_bike),
-                            _buildVehicleButton(context, ref, 'foot', Icons.directions_walk),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                if (_searchResults.isNotEmpty)
-                  Container(
-                    color: Colors.white,
-                    constraints: const BoxConstraints(maxHeight: 200),
-                    child: ListView.builder(
-                      shrinkWrap: true,
-                      itemCount: _searchResults.length,
-                      itemBuilder: (ctx, i) {
-                        final r = _searchResults[i];
-                        return ListTile(
-                          title: Text(r.displayName, maxLines: 1, overflow: TextOverflow.ellipsis),
-                          onTap: () => _startNavigation(r),
-                        );
+          // Premium Search Bar (Top Center)
+          if (!_isNavigating && !_isAuthority)
+            Align(
+              alignment: Alignment.topCenter,
+              child: Padding(
+                padding: const EdgeInsets.only(top: 60, left: 16, right: 16), // Increased top padding for separate Menu Button
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    PremiumSearchBar(
+                      searchController: _searchController,
+                      isSearching: _isSearching,
+                      onSearchChanged: (value) {
+                         _debouncer.run(() => _performSearch(value));
+                      },
+                      onSearchSubmitted: _performSearch,
+                      onClear: () {
+                        _searchController.clear();
+                        setState(() => _searchResults = []);
                       },
                     ),
-                  ),
-              ],
+                    
+                    // Search Results List (Floating)
+                    if (_searchResults.isNotEmpty)
+                      Container(
+                        margin: const EdgeInsets.only(top: 8),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(16),
+                          boxShadow: [BoxShadow(blurRadius: 10, color: Colors.black12)],
+                        ),
+                        constraints: const BoxConstraints(maxHeight: 250),
+                        child: ListView.builder(
+                          padding: EdgeInsets.zero,
+                          shrinkWrap: true,
+                          itemCount: _searchResults.length,
+                          itemBuilder: (ctx, i) {
+                            final r = _searchResults[i];
+                            return ListTile(
+                              leading: const Icon(Icons.location_on, color: Colors.grey),
+                              title: Text(r.displayName, maxLines: 2, overflow: TextOverflow.ellipsis),
+                              onTap: () => _startNavigation(r),
+                            );
+                          },
+                        ),
+                      ),
+                  ],
+                ),
+              ),
             ),
-          ),
           
            // Authority Menu Button
            if (_isAuthority)
@@ -831,244 +832,116 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
                ),
              ),
 
+
+            
+           // Persistent Menu Button (Always Visible)
+           Positioned(
+             top: 40,
+             left: 10,
+             child: SafeArea(
+               child: Builder(
+                 builder: (context) => FloatingActionButton.small(
+                   heroTag: "menuBtn",
+                   backgroundColor: Colors.white,
+                   child: const Icon(Icons.menu, color: Colors.blueGrey),
+                   onPressed: () => Scaffold.of(context).openDrawer(),
+                 ),
+               ),
+             ),
+           ),
+
           // Info Panel with Safe Area
+           // Replaced old Info Panel with TripInfoPanel
           if (!_isAuthority)
-          Positioned(
-            bottom: 0,
-            left: 0,
-            right: 0,
-            child: SafeArea(
-              child: Container(
-                margin: const EdgeInsets.all(16),
-                padding: const EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(16),
-                  boxShadow: [BoxShadow(blurRadius: 10, color: Colors.black12)],
-                ),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (_isNavigating && _currentRoute != null)
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceAround,
-                        crossAxisAlignment: CrossAxisAlignment.end,
-                        children: [
-                          Column(
-                            children: [
-                              Text("${(_currentRoute!.distance / 1000).toStringAsFixed(1)} km", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 20)),
-                              const Text("Distance"),
-                            ],
-                          ),
-                          Column(
-                            children: [
-                              Text("${(_currentRoute!.duration / 60).toStringAsFixed(0)} min", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 20, color: Colors.blue)),
-                              const Text("ETA"),
-                            ],
-                          ),
-                          // Current Speed & Limit display during Navigation
-                          Column(
-                            children: [
-                               Text("${_currentSpeed.toStringAsFixed(0)}", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 24)),
-                               const Text("km/h", style: TextStyle(fontSize: 12)),
-                               if (_currentLimit != null)
-                                 Container(
-                                   margin: const EdgeInsets.only(top: 4),
-                                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                   decoration: BoxDecoration(
-                                     border: Border.all(color: Colors.red, width: 2),
-                                     borderRadius: BorderRadius.circular(4),
-                                     color: Colors.white,
-                                   ),
-                                   child: Text("${_currentLimit}", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.black)),
-                                 ),
-                            ],
-                          ),
-                          
-                          Column(
-                            children: [
-                               ElevatedButton(
-                                onPressed: () {
-                                  setState(() {
-                                    _showDirections = !_showDirections;
-                                  });
-                                }, 
-                                style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 8), minimumSize: Size(40, 36)),
-                                child: Icon(_showDirections ? Icons.list_alt : Icons.list),
-                               ),
-                                const SizedBox(height: 4),
-                                ElevatedButton(
-                                 style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-                                 onPressed: () {
-                                   setState(() {
-                                     _isNavigating = false;
-                                     _isPreviewing = false;
-                                     _currentRoute = null;
-                                     _showDirections = false;
-                                     _stopSimulation();
-                                   });
-                                   ref.read(activeRouteProvider.notifier).clearRoute();
-                                 },
-                                 child: const Text("End Trip", style: TextStyle(color: Colors.white)),
-                                ),
-                            ],
-                          )
-                        ],
-                      )
-                    // Preview Mode UI
-                    else if (_isPreviewing && _currentRoute != null)
-                      Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                           Row(
-                             mainAxisAlignment: MainAxisAlignment.spaceAround,
-                             children: [
-                                Column(
-                                  children: [
-                                    Text("${(_currentRoute!.distance / 1000).toStringAsFixed(1)} km", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 20)),
-                                    const Text("Distance"),
-                                  ],
-                                ),
-                                Column(
-                                  children: [
-                                    Text("${(_currentRoute!.duration / 60).toStringAsFixed(0)} min", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 20, color: Colors.blue)),
-                                    const Text("ETA"),
-                                  ],
-                                ),
-                             ],
-                           ),
-                           const SizedBox(height: 10),
-                           SizedBox(
-                             width: double.infinity,
-                             child: ElevatedButton(
-                               style: ElevatedButton.styleFrom(
-                                 backgroundColor: Colors.green, 
-                                 padding: const EdgeInsets.symmetric(vertical: 12)
-                               ),
-                               onPressed: () {
-                                 setState(() {
-                                   _isPreviewing = false;
-                                   _isNavigating = true;
-                                 });
-                               },
-                               child: const Text("Start Trip", style: TextStyle(fontSize: 18, color: Colors.white, fontWeight: FontWeight.bold)),
-                             ),
-                           ),
-                           TextButton(
-                                onPressed: () {
-                                  setState(() {
-                                    _isPreviewing = false;
-                                    _currentRoute = null;
-                                  });
-                                  ref.read(activeRouteProvider.notifier).clearRoute();
-                                },
-                                child: const Text("Cancel"),
-                           ),
-                        ],
-                      )
-                    else 
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Text(
-                                  "${_currentSpeed.toStringAsFixed(0)} km/h",
-                                  style: const TextStyle(fontSize: 48, fontWeight: FontWeight.bold),
-                                ),
-                                if (_currentLimit != null)
-                                   Padding(
-                                     padding: const EdgeInsets.only(left: 10),
-                                     child: Container(
-                                       width: 50,
-                                       height: 60,
-                                       decoration: BoxDecoration(
-                                         color: Colors.white,
-                                         border: Border.all(color: Colors.red, width: 4),
-                                         borderRadius: BorderRadius.circular(8),
-                                       ),
-                                       child: Column(
-                                         mainAxisAlignment: MainAxisAlignment.center,
-                                         children: [
-                                           const Text("LIMIT", style: TextStyle(fontSize: 8, fontWeight: FontWeight.bold)),
-                                           Text("${_currentLimit}", style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
-                                         ],
-                                       ),
-                                     ),
-                                   ),
-                              ],
-                            ),
-                            Text(
-                              "${_currentPosition.latitude.toStringAsFixed(4)}, ${_currentPosition.longitude.toStringAsFixed(4)}",
-                              style: const TextStyle(fontSize: 12, color: Colors.grey),
-                            ),
-                            Container(
-                              padding: const EdgeInsets.all(4),
-                              color: Colors.black12,
-                              child: Text(
-                                "GPS: $_locationStatus",
-                                style: const TextStyle(fontSize: 10, color: Colors.red),
-                                textAlign: TextAlign.center,
-                              ),
-                            ),
-                            if (_locationStatus.contains("Error") || _locationStatus.contains("Denied"))
-                              ElevatedButton(
-                                onPressed: _checkPermissions, 
-                                child: const Text("Retry GPS")
-                              ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-          
+             TripInfoPanel(
+               isNavigating: _isNavigating,
+               isPreviewing: _isPreviewing,
+               currentRoute: _currentRoute,
+               currentSpeed: _currentSpeed,
+               currentLimit: _currentLimit,
+               distanceRemaining: _currentRoute?.distance ?? 0,
+               durationRemaining: _currentRoute?.duration ?? 0,
+               hasHazardOnRoute: _currentRoute != null && _routeIntersectsHazards(_currentRoute!.points, ref.watch(hazardsProvider)),
+               showDirections: _showDirections,
+               selectedVehicleType: ref.watch(vehicleTypeProvider),
+               onVehicleTypeChanged: (type) {
+                 ref.read(vehicleTypeProvider.notifier).setType(type);
+               },
+               onCategorySelected: (category) {
+                 _searchController.text = category;
+                 _performSearch(category);
+               },
+               onStartTrip: () {
+                 setState(() {
+                   _isPreviewing = false;
+                   _isNavigating = true;
+                 });
+                 // Animation: Zoom to driver view
+                 _mapController.move(_currentPosition, 18.0);
+               },
+               onEndTrip: () {
+                 setState(() {
+                   _isNavigating = false;
+                   _isPreviewing = false;
+                   _availableRoutes = []; 
+                   _showDirections = false;
+                   _stopSimulation();
+                 });
+                 ref.read(activeRouteProvider.notifier).clearRoute();
+               },
+               onCancelPreview: () {
+                 setState(() {
+                   _isPreviewing = false;
+                   _availableRoutes = []; 
+                   _selectedRouteIndex = 0; 
+                 });
+                 ref.read(activeRouteProvider.notifier).clearRoute();
+               },
+               onToggleDirections: () {
+                  setState(() => _showDirections = !_showDirections);
+               },
+             ),
+
+            
           // Floating Map Controls (Right Side)
-          Positioned(
-            right: 16,
-            bottom: 200, // Above the info panel (adjust as needed)
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                FloatingActionButton(
-                  heroTag: "mapType",
-                  mini: true,
-                  backgroundColor: Colors.white,
-                  onPressed: () => setState(() => _isSatellite = !_isSatellite),
-                  child: Icon(_isSatellite ? Icons.map : Icons.satellite_alt, color: Colors.blueGrey),
-                ),
-                const SizedBox(height: 10),
-                FloatingActionButton(
-                  heroTag: "alert",
-                  mini: true,
-                  backgroundColor: Colors.orange,
-                  onPressed: () => _showReportHazardDialog(_currentPosition, "user_report"),
-                  child: const Icon(Icons.add_alert, color: Colors.white),
-                ),
-                const SizedBox(height: 10),
-                FloatingActionButton(
-                  heroTag: "recenter",
-                  backgroundColor: Colors.white,
-                  onPressed: () {
-                     _mapController.move(_currentPosition, 18.0);
-                     setState(() => _isManualLocation = false);
-                  },
-                  child: const Icon(Icons.my_location, color: Colors.blue),
-                ),
-              ],
-            ),
-          ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+  Positioned(
+    right: 16,
+    bottom: 200, // Above the info panel
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        FloatingActionButton(
+          heroTag: "mapType",
+          mini: true,
+          backgroundColor: Colors.white,
+          onPressed: () => setState(() => _isSatellite = !_isSatellite),
+          child: Icon(_isSatellite ? Icons.map : Icons.satellite_alt, color: Colors.blueGrey),
+        ),
+        const SizedBox(height: 10),
+        FloatingActionButton(
+          heroTag: "alert",
+          mini: true,
+          backgroundColor: Colors.orange,
+          onPressed: () => _showReportHazardDialog(_currentPosition, "user_report"),
+          child: const Icon(Icons.add_alert, color: Colors.white),
+        ),
+        const SizedBox(height: 10),
+        FloatingActionButton(
+          heroTag: "recenter",
+          backgroundColor: Colors.white,
+          onPressed: () {
+              _mapController.move(_currentPosition, 18.0);
+              setState(() => _isManualLocation = false);
+          },
+          child: const Icon(Icons.my_location, color: Colors.blue),
+        ),
+      ],
+    ),
+  ),
+      ], // children
+    ), // Stack
+  ); // Scaffold
+ }
 
   Widget _buildVehicleButton(BuildContext context, WidgetRef ref, String type, IconData icon) {
     final selected = ref.watch(vehicleTypeProvider) == type;
