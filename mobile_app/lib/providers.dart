@@ -4,6 +4,7 @@ import 'package:latlong2/latlong.dart';
 import 'services/api_service.dart';
 import 'services/websocket_service.dart';
 import 'models/hazard.dart';
+import 'models/route_data.dart';
 
 final apiServiceProvider = Provider((ref) => ApiService());
 
@@ -36,7 +37,17 @@ class HazardsNotifier extends Notifier<List<Hazard>> {
       final jsonMsg = json.decode(message);
       if (jsonMsg['type'] == 'new_hazard') {
         final hazard = Hazard.fromJson(jsonMsg['data']);
-        state = [...state, hazard];
+        // Check if exists to update/replace, else add
+        final index = state.indexWhere((h) => h.id == hazard.id);
+        if (index >= 0) {
+           // Update existing
+           final newState = [...state];
+           newState[index] = hazard;
+           state = newState;
+        } else {
+           // Add new
+           state = [...state, hazard];
+        }
       } else if (jsonMsg['type'] == 'delete_hazard') {
         final id = jsonMsg['id'];
         state = state.where((h) => h.id != id).toList();
@@ -58,17 +69,39 @@ class HazardsNotifier extends Notifier<List<Hazard>> {
   }
 }
 
-final activeRouteProvider = NotifierProvider<ActiveRouteNotifier, List<LatLng>>(() {
+// Stores the currently active route data (including steps)
+final activeRouteProvider = NotifierProvider<ActiveRouteNotifier, RouteData?>(() {
   return ActiveRouteNotifier();
 });
 
-class ActiveRouteNotifier extends Notifier<List<LatLng>> {
+class ActiveRouteNotifier extends Notifier<RouteData?> {
   @override
-  List<LatLng> build() {
-    return [];
+  RouteData? build() {
+    return null;
   }
   
-  void updateRoute(List<LatLng> newRoute) {
+  void updateRoute(RouteData newRoute) {
     state = newRoute;
   }
+  
+  void clearRoute() {
+    state = null;
+  }
 }
+
+// Stores the selected vehicle type
+final vehicleTypeProvider = NotifierProvider<VehicleTypeNotifier, String>(() {
+  return VehicleTypeNotifier();
+});
+
+class VehicleTypeNotifier extends Notifier<String> {
+  @override
+  String build() {
+    return 'car';
+  }
+
+  void setType(String type) {
+    state = type;
+  }
+}
+

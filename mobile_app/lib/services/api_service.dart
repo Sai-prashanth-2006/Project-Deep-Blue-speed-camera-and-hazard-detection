@@ -5,6 +5,8 @@ import 'package:latlong2/latlong.dart';
 import '../models/search_result.dart';
 import '../models/hazard.dart';
 import '../models/speed_zone.dart';
+import '../models/route_data.dart';
+import '../models/route_step.dart';
 
 class ApiService {
   static String get baseUrl {
@@ -31,23 +33,42 @@ class ApiService {
     }
   }
 
-  Future<List<List<LatLng>>> getRoutes(LatLng start, LatLng end) async {
+  // Updated to return List<RouteData> and accept vehicleType
+  Future<List<RouteData>> getRoutes(LatLng start, LatLng end, {String vehicleType = 'car'}) async {
     final startStr = "${start.latitude},${start.longitude}";
     final endStr = "${end.latitude},${end.longitude}";
     
-    // Request alternatives
-    final response = await http.get(Uri.parse('$baseUrl/route?start=$startStr&end=$endStr&alternatives=true'));
+    // Pass vehicleType as profile or separate param depending on backend support
+    // Assuming backend might take 'profile' or similar. 
+    // If backend ignores it, it just defaults to car.
+    // We add &steps=true to get instructions (OSRM standard)
+    final url = '$baseUrl/route?start=$startStr&end=$endStr&alternatives=true&steps=true&profile=$vehicleType';
+    
+    final response = await http.get(Uri.parse(url));
     
     if (response.statusCode == 200) {
       final data = json.decode(response.body);
       if (data['routes'] != null) {
-        // Return list of routes (each route is a list of LatLng)
-        return (data['routes'] as List).map<List<LatLng>>((route) {
+        return (data['routes'] as List).map<RouteData>((route) {
            final geometry = route['geometry'];
            final coordinates = geometry['coordinates'] as List;
-           return coordinates.map<LatLng>((coord) {
+           final points = coordinates.map<LatLng>((coord) {
              return LatLng(coord[1], coord[0]);
            }).toList();
+           
+           final legs = route['legs'] as List;
+           List<RouteStep> steps = [];
+           if (legs.isNotEmpty) {
+             final stepsJson = legs[0]['steps'] as List;
+             steps = stepsJson.map((s) => RouteStep.fromJson(s)).toList();
+           }
+
+           return RouteData(
+             points: points,
+             steps: steps,
+             distance: (route['distance'] as num).toDouble(),
+             duration: (route['duration'] as num).toDouble(),
+           );
         }).toList();
       }
       return [];
@@ -59,7 +80,7 @@ class ApiService {
   // Deprecated single route method, kept for compatibility if needed or redirect
   Future<List<LatLng>> getRoute(LatLng start, LatLng end) async {
     final routes = await getRoutes(start, end);
-    if (routes.isNotEmpty) return routes.first;
+    if (routes.isNotEmpty) return routes.first.points;
     return [];
   }
   
@@ -110,6 +131,13 @@ class ApiService {
       return data.map((json) => SpeedZone.fromJson(json)).toList();
     } else {
       throw Exception('Failed to load speed zones');
+    }
+  }
+
+  Future<void> verifyHazard(int id) async {
+    final response = await http.put(Uri.parse('$baseUrl/hazards/$id/verify'));
+    if (response.statusCode != 200) {
+       throw Exception('Failed to verify hazard');
     }
   }
 }

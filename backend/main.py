@@ -84,7 +84,7 @@ def search_places(q: str, lat: Optional[float] = None, lon: Optional[float] = No
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/route")
-def get_route(start: str, end: str, alternatives: str = "false"):
+def get_route(start: str, end: str, alternatives: str = "false", steps: str = "false", profile: str = "car"):
     """
     Proxy to OSRM. 
     Input format: "lat,lng" 
@@ -94,8 +94,17 @@ def get_route(start: str, end: str, alternatives: str = "false"):
         start_lat, start_lng = start.split(',')
         end_lat, end_lng = end.split(',')
         
+        # Map profile to OSRM modes
+        osrm_mode = "driving"
+        if profile == "bike":
+            osrm_mode = "bike" # OSRM public demo sometimes uses 'cycling' or 'bike', let's try 'driving' as fallback if not sure, but 'bike' is common in some setups. 
+            # Actually standard OSRM demo server profiles are: driving, walking, cycling.
+            osrm_mode = "cycling"
+        elif profile == "foot":
+            osrm_mode = "walking"
+        
         # OSRM url format: {lng},{lat};{lng},{lat}
-        osrm_url = f"http://router.project-osrm.org/route/v1/driving/{start_lng},{start_lat};{end_lng},{end_lat}?overview=full&geometries=geojson&alternatives={alternatives}"
+        osrm_url = f"http://router.project-osrm.org/route/v1/{osrm_mode}/{start_lng},{start_lat};{end_lng},{end_lat}?overview=full&geometries=geojson&alternatives={alternatives}&steps={steps}"
         
         response = requests.get(osrm_url)
         response.raise_for_status()
@@ -130,6 +139,18 @@ async def delete_hazard(hazard_id: int):
     # Broadcast deletion
     await manager.broadcast(json.dumps({"type": "delete_hazard", "id": hazard_id}))
     return {"status": "deleted", "id": hazard_id}
+
+@app.put("/hazards/{hazard_id}/verify")
+async def verify_hazard(hazard_id: int):
+    for h in hazards:
+        if h["id"] == hazard_id:
+            h["verified"] = True
+            # Broadcast update - reusing new_hazard type or creating a specific update type
+            # Sending 'new_hazard' will upsert in frontend if logic handles ID matching, 
+            # otherwise we should send 'update_hazard'. For MVP, let's send 'new_hazard' which contains full data.
+            await manager.broadcast(json.dumps({"type": "new_hazard", "data": h}))
+            return h
+    raise HTTPException(status_code=404, detail="Hazard not found")
 
 
 @app.post("/auth/login")

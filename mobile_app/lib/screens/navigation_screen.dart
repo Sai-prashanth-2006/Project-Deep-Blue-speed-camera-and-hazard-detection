@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
+import 'dart:async'; // Added for Timer
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
@@ -9,6 +10,8 @@ import '../providers.dart';
 import '../models/search_result.dart';
 import '../models/speed_zone.dart';
 import '../models/hazard.dart';
+import '../models/route_data.dart';
+import '../models/route_step.dart';
 
 class NavigationScreen extends ConsumerStatefulWidget {
   const NavigationScreen({super.key});
@@ -22,16 +25,25 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
   LatLng _currentPosition = LatLng(37.7749, -122.4194);
   double _currentHeading = 0.0;
   double _currentSpeed = 0.0; 
-  bool _hasPermissions = false;
-  String _locationStatus = "Waiting for GPS..."; // Debug status
+  int? _currentLimit; // Stores current speed limit
+  bool _hasPermissions = false; // Permission status
+  String _locationStatus = "Waiting for GPS..."; 
+  bool _isManualLocation = false; // Prevents GPS override
   
   // Search State
+  final TextEditingController _searchController = TextEditingController();
   bool _isSearching = false;
   List<SearchResult> _searchResults = [];
   
   // Navigation State
-  List<LatLng> _routePoints = [];
+  RouteData? _currentRoute; 
   bool _isNavigating = false;
+  bool _isPreviewing = false; // New state for Route Preview
+  bool _showDirections = false;
+  
+  // Simulation State
+  Timer? _simulationTimer;
+  int _simulationIndex = 0;
   
   // Alerts
   List<SpeedZone> _speedZones = [];
@@ -48,6 +60,13 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
     super.initState();
     _checkPermissions();
     _loadSpeedZones();
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    _stopSimulation();
+    super.dispose();
   }
 
   Future<void> _loadSpeedZones() async {
@@ -135,6 +154,8 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
 
     Geolocator.getPositionStream(locationSettings: locationSettings).listen(
       (Position position) {
+        if (_isManualLocation) return; // Ignore GPS if manual set
+
         final pos = LatLng(position.latitude, position.longitude);
         setState(() {
           _currentPosition = pos;
@@ -151,6 +172,8 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
 
   void _checkSpeedLimit(LatLng pos, double speed) {
     if (_isAuthority) return; // No alerts for authority mode
+    
+    int? detectedLimit;
 
     String? newAlert;
     for (var zone in _speedZones) {
@@ -159,10 +182,16 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
         zone.lat, zone.lng
       );
       if (distance < zone.radius) {
+         detectedLimit = zone.limit;
          if (speed > zone.limit) {
            newAlert = "Reduce speed to ${zone.limit} km/h";
          }
       }
+    }
+    
+    // Update Limit State
+    if (detectedLimit != _currentLimit) {
+       setState(() => _currentLimit = detectedLimit);
     }
     
     final hazards = ref.read(hazardsProvider);
@@ -184,8 +213,20 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
   }
 
   void _handleMapTap(TapPosition tapPosition, LatLng point) {
+    // Dismiss keyboard and close search results (if logic required)
+    FocusScope.of(context).unfocus();
+    
     if (_isAuthority) {
        _showReportHazardDialog(point, "authority_hazard");
+    } else {
+       // Driver Mode: Tap to navigate
+        // Create a temporary SearchResult. address is map of string->dynamic
+        final tempResult = SearchResult(
+          displayName: "Selected Location", 
+          lat: point.latitude, 
+          lng: point.longitude,
+        );
+        _startNavigation(tempResult);
     }
   }
 
@@ -215,10 +256,12 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
     });
     
     try {
+      final vehicleType = ref.read(vehicleTypeProvider);
       // Get Routes (potentially multiple)
       final routes = await ref.read(apiServiceProvider).getRoutes(
         _currentPosition, 
-        LatLng(result.lat, result.lng)
+        LatLng(result.lat, result.lng),
+        vehicleType: vehicleType,
       );
       
       print("Routes found: ${routes.length}");
@@ -227,10 +270,10 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
 
       // Smart Rerouting Logic:
       // If primary route (index 0) has a hazard, pick alternate (index 1) if available
-      List<LatLng> bestRoute = routes[0];
+      RouteData bestRoute = routes[0];
       final hazards = ref.read(hazardsProvider);
       
-      bool primaryHasHazard = _routeIntersectsHazards(bestRoute, hazards);
+      bool primaryHasHazard = _routeIntersectsHazards(bestRoute.points, hazards);
       print("Primary route has hazard: $primaryHasHazard");
       
       if (primaryHasHazard && routes.length > 1) {
@@ -243,10 +286,15 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
       }
 
       setState(() {
-        _routePoints = bestRoute;
-        _isNavigating = true;
+        _currentRoute = bestRoute;
+        _isNavigating = false; // Wait for "Start Trip"
+        _isPreviewing = true;  // Show Preview UI
+        _showDirections = false;
       });
-      _mapController.move(_currentPosition, 18.0);
+      // Zoom out to show whole route? Or just user position?
+      // Let's center on user first
+      _mapController.move(_currentPosition, 16.0);
+      // _startSimulation(); // Disabled per user request (Arrow should move with user)
       
     } catch (e) {
       print("Navigation error: $e");
@@ -257,6 +305,11 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
   bool _routeIntersectsHazards(List<LatLng> route, List<Hazard> hazards) {
     // Check coverage every 10 points
     for (var hazard in hazards) {
+      if (!hazard.verified && !_isAuthority) continue; // Skip unverified for routing check if not authority? 
+      // Actually routing should probably avoid even unverified hazards for safety? 
+      // Let's assume routing avoids verified hazards only for now to reduce noise.
+      if (!hazard.verified) continue; 
+
       for (int i = 0; i < route.length; i += 10) {
         final dist = Geolocator.distanceBetween(
           hazard.lat, hazard.lng, 
@@ -272,6 +325,56 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
     return false;
   }
 
+  void _startSimulation() {
+    _stopSimulation();
+    if (_currentRoute == null || _currentRoute!.points.isEmpty) return;
+
+    _simulationIndex = 0;
+    // Find closest point on route to start? Or just start from beginning?
+    // For demo, let's start from beginning or current index if close.
+    // Let's just reset to 0 for simplicity of "Start Navigation"
+    
+    // Simulate movement
+    _simulationTimer = Timer.periodic(const Duration(milliseconds: 1000), (timer) {
+      if (!mounted) {
+        _stopSimulation();
+        return;
+      }
+      
+      if (_currentRoute == null || _simulationIndex >= _currentRoute!.points.length - 1) {
+        _stopSimulation();
+        setState(() => _isNavigating = false); // End navigation
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Arrived at destination!")));
+        return;
+      }
+
+      setState(() {
+         // Move faster: skip points if dense
+         int speedMultiplier = 3; 
+         _simulationIndex = (_simulationIndex + speedMultiplier).clamp(0, _currentRoute!.points.length - 1);
+         
+         final nextPos = _currentRoute!.points[_simulationIndex];
+         
+         // Calculate heading
+         if (_simulationIndex > 0) {
+           final prevPos = _currentRoute!.points[_simulationIndex - speedMultiplier < 0 ? 0 : _simulationIndex - speedMultiplier];
+           _currentHeading = Geolocator.bearingBetween(prevPos.latitude, prevPos.longitude, nextPos.latitude, nextPos.longitude);
+         }
+         
+         _currentPosition = nextPos;
+         _currentSpeed = 45.0; // Simulated speed km/h
+      });
+      
+      _mapController.move(_currentPosition, 18.0);
+      _checkSpeedLimit(_currentPosition, _currentSpeed);
+    });
+  }
+
+  void _stopSimulation() {
+    _simulationTimer?.cancel();
+    _simulationTimer = null;
+  }
+
   void _handleHazardTap(Hazard hazard) {
     if (_isAuthority) {
       showDialog(
@@ -284,6 +387,29 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
             children: [
               Text("Tag: ${hazard.tag}"),
               Text("Description: ${hazard.description}"),
+              Text("Status: ${hazard.verified ? 'Verified' : 'Unverified'}", style: TextStyle(color: hazard.verified ? Colors.green : Colors.orange, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 10),
+              
+              if (!hazard.verified)
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton(
+                    style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+                    onPressed: () async {
+                       try {
+                         await ref.read(apiServiceProvider).verifyHazard(hazard.id);
+                         Navigator.pop(ctx);
+                         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("Hazard Verified!")));
+                         // State update will happen via WebSocket or Poll, but let's assume we might need manual refresh if WS not perfect?
+                         // WS should handle it.
+                       } catch (e) {
+                         ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("Verification failed: $e")));
+                       }
+                    },
+                    child: const Text("Verify Hazard", style: TextStyle(color: Colors.white)),
+                  ),
+                ),
+                
               const SizedBox(height: 10),
               const Text("Do you want to delete this hazard?"),
             ],
@@ -319,7 +445,8 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
     // Hidden feature: Manual Teleport (useful for Demo/Web if GPS is bad)
     setState(() {
       _currentPosition = point;
-      _locationStatus = "Manual Location Set";
+      _isManualLocation = true; // Lock location
+      _locationStatus = "Manual Location Set (GPS Paused)";
       // Check hazards/speed limits at new location
       _checkSpeedLimit(_currentPosition, _currentSpeed);
     });
@@ -412,6 +539,7 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
   @override
   Widget build(BuildContext context) {
     final hazards = ref.watch(hazardsProvider);
+    final vehicleType = ref.watch(vehicleTypeProvider);
     
     return Scaffold(
       // ... AppBar / Drawer same as before ... 
@@ -460,15 +588,15 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
                 const RichAttributionWidget(
                   attributions: [
                     TextSourceAttribution(
-                      'Tiles © Esri — Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community',
+                      'Tiles © Esri',
                     ),
                   ],
                 ),
               PolylineLayer(
                 polylines: [
-                  if (_routePoints.isNotEmpty)
+                  if (_currentRoute != null)
                     Polyline(
-                      points: _routePoints,
+                      points: _currentRoute!.points,
                       strokeWidth: 5.0,
                       color: Colors.blue,
                     ),
@@ -486,16 +614,56 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
                       child: const Icon(Icons.navigation, color: Colors.blue, size: 40),
                     ),
                   ),
+                  
+                  
+                  // Route Start/End Markers
+                  if ((_isNavigating || _isPreviewing) && _currentRoute != null) ...[
+                     // Start (Green Flag)
+                     Marker(
+                       point: _currentRoute!.points.first,
+                       width: 40,
+                       height: 40,
+                       child: Container(
+                         decoration: const BoxDecoration(
+                           color: Colors.white, 
+                           shape: BoxShape.circle,
+                           boxShadow: [BoxShadow(blurRadius: 5, color: Colors.black26)]
+                         ),
+                         child: const Icon(Icons.flag, color: Colors.green, size: 25),
+                       ),
+                     ),
+                     // End (Red Flag)
+                     Marker(
+                       point: _currentRoute!.points.last,
+                       width: 40,
+                       height: 40,
+                       child: Container(
+                         decoration: const BoxDecoration(
+                           color: Colors.white, 
+                           shape: BoxShape.circle,
+                           boxShadow: [BoxShadow(blurRadius: 5, color: Colors.black26)]
+                         ),
+                         child: const Icon(Icons.flag, color: Colors.red, size: 25),
+                       ),
+                     ),
+                  ],
+
                   // Hazards
-                  ...hazards.map((h) => Marker(
+                  ...hazards.where((h) => _isAuthority || h.verified).map((h) => Marker(
                     point: LatLng(h.lat, h.lng),
                     width: 30,
                     height: 30,
                     child: GestureDetector(
                       onTap: () => _handleHazardTap(h),
                       child: Tooltip(
-                        message: "${h.tag}: ${h.description}",
-                        child: Icon(Icons.warning, color: h.type == 'authority_hazard' ? Colors.purple : Colors.red, size: 30),
+                        message: "${h.tag}: ${h.description} ${!h.verified ? '(Unverified)' : ''}",
+                        child: Icon(
+                          Icons.warning, 
+                          color: h.type == 'authority_hazard' 
+                              ? Colors.purple 
+                              : (h.verified ? Colors.red : Colors.orange), 
+                          size: 30
+                        ),
                       ),
                     ),
                   )),
@@ -531,32 +699,56 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
             left: 16,
             right: 16,
             child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 Card(
                   elevation: 4,
-                  child: Row(
+                  child: Column(
                     children: [
-                      Builder(builder: (context) => IconButton(
-                        icon: const Icon(Icons.menu),
-                        onPressed: () => Scaffold.of(context).openDrawer(),
-                      )),
-                      Expanded(
-                        child: Padding(
-                          padding: const EdgeInsets.only(right: 16.0),
-                          child: TextField(
-                            decoration: const InputDecoration(
-                              hintText: "Search Place...",
-                              border: InputBorder.none,
+                      Row(
+                        children: [
+                          Builder(builder: (context) => IconButton(
+                            icon: const Icon(Icons.menu),
+                            onPressed: () => Scaffold.of(context).openDrawer(),
+                          )),
+                          Expanded(
+                            child: Padding(
+                              padding: const EdgeInsets.only(right: 16.0),
+                              child: TextField(
+                                controller: _searchController,
+                                decoration: const InputDecoration(
+                                  hintText: "Search Place...",
+                                  border: InputBorder.none,
+                                ),
+                                onSubmitted: _performSearch,
+                              ),
                             ),
-                            onSubmitted: _performSearch,
                           ),
-                        ),
+                          IconButton(
+                            icon: _isSearching 
+                              ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
+                              : const Icon(Icons.search), 
+                            onPressed: () {
+                               if (_searchController.text.isNotEmpty) {
+                                  _performSearch(_searchController.text);
+                                  FocusScope.of(context).unfocus();
+                               }
+                            }
+                          ),
+                        ],
                       ),
-                      IconButton(
-                        icon: _isSearching 
-                          ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2))
-                          : const Icon(Icons.search), 
-                        onPressed: () {}
+                      // Vehicle Type Selector
+                      if (!_isNavigating)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                          children: [
+                            _buildVehicleButton(context, ref, 'car', Icons.directions_car),
+                            _buildVehicleButton(context, ref, 'bike', Icons.directions_bike),
+                            _buildVehicleButton(context, ref, 'foot', Icons.directions_walk),
+                          ],
+                        ),
                       ),
                     ],
                   ),
@@ -595,6 +787,50 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
                )),
              ),
 
+          // Directions List Overlay
+          if (_isNavigating && _showDirections && _currentRoute != null)
+             Positioned(
+               top: 180, 
+               left: 16,
+               right: 16,
+               bottom: 120, // Leave space for bottom panel
+               child: Container(
+                 decoration: BoxDecoration(
+                   color: Colors.white.withOpacity(0.95),
+                   borderRadius: BorderRadius.circular(16),
+                   boxShadow: const [BoxShadow(blurRadius: 10, color: Colors.black26)],
+                 ),
+                 child: Column(
+                   children: [
+                     Padding(
+                       padding: const EdgeInsets.all(16.0),
+                       child: Row(
+                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                         children: [
+                           Text("Directions (${_currentRoute!.steps.length} steps)", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+                           IconButton(icon: const Icon(Icons.close), onPressed: () => setState(() => _showDirections = false)),
+                         ],
+                       ),
+                     ),
+                     Divider(height: 1),
+                     Expanded(
+                       child: ListView.builder(
+                         itemCount: _currentRoute!.steps.length,
+                         itemBuilder: (ctx, i) {
+                           final step = _currentRoute!.steps[i];
+                           return ListTile(
+                             leading: const Icon(Icons.turn_right), // Simplified icon
+                             title: Text(step.instruction),
+                             subtitle: Text("${step.distance.toStringAsFixed(0)} m"),
+                           );
+                         },
+                       ),
+                     ),
+                   ],
+                 ),
+               ),
+             ),
+
           // Info Panel with Safe Area
           if (!_isAuthority)
           Positioned(
@@ -613,17 +849,158 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                    if (_isNavigating && _currentRoute != null)
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceAround,
+                        crossAxisAlignment: CrossAxisAlignment.end,
+                        children: [
+                          Column(
+                            children: [
+                              Text("${(_currentRoute!.distance / 1000).toStringAsFixed(1)} km", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 20)),
+                              const Text("Distance"),
+                            ],
+                          ),
+                          Column(
+                            children: [
+                              Text("${(_currentRoute!.duration / 60).toStringAsFixed(0)} min", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 20, color: Colors.blue)),
+                              const Text("ETA"),
+                            ],
+                          ),
+                          // Current Speed & Limit display during Navigation
+                          Column(
+                            children: [
+                               Text("${_currentSpeed.toStringAsFixed(0)}", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 24)),
+                               const Text("km/h", style: TextStyle(fontSize: 12)),
+                               if (_currentLimit != null)
+                                 Container(
+                                   margin: const EdgeInsets.only(top: 4),
+                                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                   decoration: BoxDecoration(
+                                     border: Border.all(color: Colors.red, width: 2),
+                                     borderRadius: BorderRadius.circular(4),
+                                     color: Colors.white,
+                                   ),
+                                   child: Text("${_currentLimit}", style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.black)),
+                                 ),
+                            ],
+                          ),
+                          
+                          Column(
+                            children: [
+                               ElevatedButton(
+                                onPressed: () {
+                                  setState(() {
+                                    _showDirections = !_showDirections;
+                                  });
+                                }, 
+                                style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(horizontal: 8), minimumSize: Size(40, 36)),
+                                child: Icon(_showDirections ? Icons.list_alt : Icons.list),
+                               ),
+                                const SizedBox(height: 4),
+                                ElevatedButton(
+                                 style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+                                 onPressed: () {
+                                   setState(() {
+                                     _isNavigating = false;
+                                     _isPreviewing = false;
+                                     _currentRoute = null;
+                                     _showDirections = false;
+                                     _stopSimulation();
+                                   });
+                                   ref.read(activeRouteProvider.notifier).clearRoute();
+                                 },
+                                 child: const Text("End Trip", style: TextStyle(color: Colors.white)),
+                                ),
+                            ],
+                          )
+                        ],
+                      )
+                    // Preview Mode UI
+                    else if (_isPreviewing && _currentRoute != null)
+                      Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                           Row(
+                             mainAxisAlignment: MainAxisAlignment.spaceAround,
+                             children: [
+                                Column(
+                                  children: [
+                                    Text("${(_currentRoute!.distance / 1000).toStringAsFixed(1)} km", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 20)),
+                                    const Text("Distance"),
+                                  ],
+                                ),
+                                Column(
+                                  children: [
+                                    Text("${(_currentRoute!.duration / 60).toStringAsFixed(0)} min", style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 20, color: Colors.blue)),
+                                    const Text("ETA"),
+                                  ],
+                                ),
+                             ],
+                           ),
+                           const SizedBox(height: 10),
+                           SizedBox(
+                             width: double.infinity,
+                             child: ElevatedButton(
+                               style: ElevatedButton.styleFrom(
+                                 backgroundColor: Colors.green, 
+                                 padding: const EdgeInsets.symmetric(vertical: 12)
+                               ),
+                               onPressed: () {
+                                 setState(() {
+                                   _isPreviewing = false;
+                                   _isNavigating = true;
+                                 });
+                               },
+                               child: const Text("Start Trip", style: TextStyle(fontSize: 18, color: Colors.white, fontWeight: FontWeight.bold)),
+                             ),
+                           ),
+                           TextButton(
+                                onPressed: () {
+                                  setState(() {
+                                    _isPreviewing = false;
+                                    _currentRoute = null;
+                                  });
+                                  ref.read(activeRouteProvider.notifier).clearRoute();
+                                },
+                                child: const Text("Cancel"),
+                           ),
+                        ],
+                      )
+                    else 
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
                         Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Text(
-                              "${_currentSpeed.toStringAsFixed(0)} km/h",
-                              style: const TextStyle(fontSize: 48, fontWeight: FontWeight.bold),
+                            Row(
+                              children: [
+                                Text(
+                                  "${_currentSpeed.toStringAsFixed(0)} km/h",
+                                  style: const TextStyle(fontSize: 48, fontWeight: FontWeight.bold),
+                                ),
+                                if (_currentLimit != null)
+                                   Padding(
+                                     padding: const EdgeInsets.only(left: 10),
+                                     child: Container(
+                                       width: 50,
+                                       height: 60,
+                                       decoration: BoxDecoration(
+                                         color: Colors.white,
+                                         border: Border.all(color: Colors.red, width: 4),
+                                         borderRadius: BorderRadius.circular(8),
+                                       ),
+                                       child: Column(
+                                         mainAxisAlignment: MainAxisAlignment.center,
+                                         children: [
+                                           const Text("LIMIT", style: TextStyle(fontSize: 8, fontWeight: FontWeight.bold)),
+                                           Text("${_currentLimit}", style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold)),
+                                         ],
+                                       ),
+                                     ),
+                                   ),
+                              ],
                             ),
-                            const Text("Current Speed"),
                             Text(
                               "${_currentPosition.latitude.toStringAsFixed(4)}, ${_currentPosition.longitude.toStringAsFixed(4)}",
                               style: const TextStyle(fontSize: 12, color: Colors.grey),
@@ -642,43 +1019,47 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
                                 onPressed: _checkPermissions, 
                                 child: const Text("Retry GPS")
                               ),
-                          ],
-                        ),
-                        FloatingActionButton(
-                          onPressed: () {
-                             _showReportHazardDialog(_currentPosition, "user_report");
-                          },
-                          backgroundColor: Colors.orange,
-                          child: const Icon(Icons.add_alert),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 10),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        // Map Type Toggle
-                        FloatingActionButton(
-                          heroTag: "mapType",
-                          mini: true,
-                          backgroundColor: Colors.white,
-                          onPressed: () => setState(() => _isSatellite = !_isSatellite),
-                          child: Icon(_isSatellite ? Icons.map : Icons.satellite_alt, color: Colors.blueGrey),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(child: SizedBox(
-                          child: ElevatedButton(
-                            onPressed: () {
-                               _mapController.move(_currentPosition, 18.0);
-                            },
-                            style: ElevatedButton.styleFrom(
-                              padding: const EdgeInsets.symmetric(vertical: 12),
-                            ),
-                            child: const Text("Re-center Camera"),
-                          ),
-                        )),
-                      ]
-                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          
+          // Floating Map Controls (Right Side)
+          Positioned(
+            right: 16,
+            bottom: 200, // Above the info panel (adjust as needed)
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                FloatingActionButton(
+                  heroTag: "mapType",
+                  mini: true,
+                  backgroundColor: Colors.white,
+                  onPressed: () => setState(() => _isSatellite = !_isSatellite),
+                  child: Icon(_isSatellite ? Icons.map : Icons.satellite_alt, color: Colors.blueGrey),
+                ),
+                const SizedBox(height: 10),
+                FloatingActionButton(
+                  heroTag: "alert",
+                  mini: true,
+                  backgroundColor: Colors.orange,
+                  onPressed: () => _showReportHazardDialog(_currentPosition, "user_report"),
+                  child: const Icon(Icons.add_alert, color: Colors.white),
+                ),
+                const SizedBox(height: 10),
+                FloatingActionButton(
+                  heroTag: "recenter",
+                  backgroundColor: Colors.white,
+                  onPressed: () {
+                     _mapController.move(_currentPosition, 18.0);
+                     setState(() => _isManualLocation = false);
+                  },
+                  child: const Icon(Icons.my_location, color: Colors.blue),
+                ),
+              ],
+            ),
+          ),
                   ],
                 ),
               ),
@@ -686,6 +1067,17 @@ class _NavigationScreenState extends ConsumerState<NavigationScreen> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildVehicleButton(BuildContext context, WidgetRef ref, String type, IconData icon) {
+    final selected = ref.watch(vehicleTypeProvider) == type;
+    return IconButton(
+      icon: Icon(icon, color: selected ? Colors.blue : Colors.grey),
+      onPressed: () {
+        ref.read(vehicleTypeProvider.notifier).setType(type);
+      },
+      tooltip: type.toUpperCase(),
     );
   }
 }
